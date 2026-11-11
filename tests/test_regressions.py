@@ -178,6 +178,59 @@ class TestDrawdownBaseline:
         assert stats.to_drawdown_series(returns).iloc[0] == pytest.approx(-0.10)
 
 
+class TestDrawdownRangeIndex:
+    """Drawdown invented a Timedelta-based index label (#575)."""
+
+    RETURNS = [-0.10, 0.20, -0.05]  # dips from 1.0 to 0.9, recovers, dips to 0.97
+    PRICES = [100.0, 90.0, 110.0]  # peaks at 110, troughs at 90 => -10%
+
+    def test_max_drawdown_on_range_index_returns(self):
+        returns = pd.Series(self.RETURNS)
+
+        assert stats.max_drawdown(returns) == pytest.approx(-0.10)
+
+    def test_drawdown_series_on_range_index_returns(self):
+        returns = pd.Series(self.RETURNS)
+
+        dd = stats.to_drawdown_series(returns)
+
+        expected = pd.Series([-0.10, 0.0, -0.05])
+        pd.testing.assert_series_equal(dd, expected, check_names=False)
+
+    def test_max_drawdown_on_range_index_prices(self):
+        prices = pd.Series(self.PRICES)
+
+        assert stats.max_drawdown(prices) == pytest.approx(-0.10)
+
+    def test_drawdown_series_preserves_the_range_index(self):
+        returns = pd.Series(self.RETURNS)
+
+        dd = stats.to_drawdown_series(returns)
+
+        assert isinstance(dd.index, pd.RangeIndex)
+        assert list(dd.index) == list(returns.index)
+
+    def test_dataframe_columns_get_their_own_baseline(self):
+        frame = pd.DataFrame(
+            {"from_returns": self.RETURNS, "prices": self.PRICES},
+            index=pd.RangeIndex(len(self.RETURNS)),
+        )
+
+        result = stats.max_drawdown(frame)
+        dd = stats.to_drawdown_series(frame)
+
+        assert result["from_returns"] == pytest.approx(-0.10)
+        assert result["prices"] == pytest.approx(-0.10)
+        pd.testing.assert_frame_equal(
+            dd,
+            pd.DataFrame(
+                {"from_returns": [-0.10, 0.0, -0.05], "prices": [0.0, -0.10, 0.0]},
+                index=frame.index,
+            ),
+            check_names=False,
+        )
+
+
 class TestPrepareReturnsCache:
     """Equivalent Series and DataFrames used to share a cache entry."""
 

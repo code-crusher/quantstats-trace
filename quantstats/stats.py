@@ -2674,6 +2674,31 @@ def _get_baseline_value(prices, from_returns):
     return 1.0 if bool(from_returns) else prices.iloc[0]
 
 
+def _running_peak(prices, from_returns):
+    """
+    Running peak of the price series, with the starting equity folded in.
+
+    The equity held just before the first observation joins the peak directly
+    rather than being appended as a phantom data point: a first-period loss
+    then still counts against the starting equity, and no index label has to
+    be invented (which fails on a RangeIndex).
+
+    Args:
+        prices (pd.Series | pd.DataFrame): Price series
+        from_returns (bool | pd.Series): Whether the prices were rebuilt from
+            returns; per column for DataFrame input
+
+    Returns:
+        pd.Series | pd.DataFrame: Running peak(s), never below the baseline
+    """
+    baseline_value = _get_baseline_value(prices, from_returns)
+
+    expanding_max = prices.expanding(min_periods=0).max()
+    if isinstance(prices, _pd.DataFrame):
+        return expanding_max.clip(lower=baseline_value, axis="columns")
+    return expanding_max.clip(lower=baseline_value)
+
+
 def max_drawdown(prices: Returns) -> float:
     """
     Calculate the maximum drawdown from peak to trough.
@@ -2705,25 +2730,14 @@ def max_drawdown(prices: Returns) -> float:
     if len(prices) == 0:
         return 0.0
 
-    # Handle edge case: if first value represents a loss from baseline
-    # Add a phantom baseline value to ensure proper drawdown calculation
-    try:
-        time_delta = prices.index.freq or _pd.Timedelta(days=1)
-    except Exception:
-        time_delta = _pd.Timedelta(days=1)
+    # A first-period loss must count against the starting equity, so the
+    # equity held just before the first observation joins the running peak
+    # instead of being appended as a phantom point: that avoids inventing
+    # an index label, which fails on a RangeIndex.
+    running_max = _running_peak(prices, from_returns)
 
-    phantom_date = prices.index[0] - time_delta
-
-    # Determine appropriate baseline value
-    baseline_value = _get_baseline_value(prices, from_returns)
-
-    # Create extended series with phantom baseline
-    extended_prices = prices.copy()
-    extended_prices.loc[phantom_date] = baseline_value
-    extended_prices = extended_prices.sort_index()
-
-    # Calculate drawdown with phantom baseline
-    return (extended_prices / extended_prices.expanding(min_periods=0).max()).min() - 1
+    # Calculate drawdown with baseline included in the running peak
+    return (prices / running_max).min() - 1
 
 
 def to_drawdown_series(returns):
@@ -2756,28 +2770,18 @@ def to_drawdown_series(returns):
     if len(prices) == 0:
         return _pd.Series([], dtype=float, index=returns.index)
 
-    # Handle edge case: if first value represents a loss from baseline
-    # Add a phantom baseline value to ensure proper drawdown calculation
-    try:
-        time_delta = prices.index.freq or _pd.Timedelta(days=1)
-    except Exception:
-        time_delta = _pd.Timedelta(days=1)
-
-    phantom_date = prices.index[0] - time_delta
-
-    # Determine appropriate baseline value
+    # A first-period loss must count against the starting equity, so the
+    # equity held just before the first observation joins the running peak
+    # instead of being appended as a phantom point: that avoids inventing
+    # an index label, which fails on a RangeIndex.
     baseline_value = _get_baseline_value(prices, from_returns)
 
-    # Create extended series with phantom baseline
-    extended_prices = prices.copy()
-    extended_prices.loc[phantom_date] = baseline_value
-    extended_prices = extended_prices.sort_index()
-
-    # Calculate drawdown series with phantom baseline
-    dd = extended_prices / _np.maximum.accumulate(extended_prices) - 1.0
-
-    # Remove phantom point and return original time series
-    dd = dd.drop(phantom_date)
+    # Calculate drawdown series with baseline included in the running peak
+    if isinstance(prices, _pd.DataFrame):
+        running_max = prices.cummax().clip(lower=baseline_value, axis="columns")
+    else:
+        running_max = prices.cummax().clip(lower=baseline_value)
+    dd = prices / running_max - 1.0
 
     # Clean up infinite and zero values
     return dd.replace([_np.inf, -_np.inf, -0], 0)  # type: ignore[attr-defined]
