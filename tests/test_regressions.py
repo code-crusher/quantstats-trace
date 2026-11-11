@@ -930,3 +930,135 @@ class TestConditionalValueAtRisk:
 
         assert list(result.index) == ["a", "b"]
         assert result["b"] == pytest.approx(result["a"] * 2, rel=1e-9)
+
+
+class TestSubDollarPriceDetection:
+    """A price series that never exceeds $1 was read as returns (#571).
+
+    The detector was "max > 1", so a sub-$1 price path (a token, a penny
+    stock, a rebased index) was passed through unconverted. stats.sharpe()
+    then divided the *levels* by their own dispersion and returned a
+    plausible-looking number instead of raising or warning.
+    """
+
+    @staticmethod
+    def _series(max_price=0.6):
+        rng = np.random.default_rng(42)
+        idx = pd.bdate_range("2024-01-01", periods=250)
+        returns = pd.Series(rng.normal(0.0002, 0.019, 250), index=idx)
+        wealth = (1 + returns).cumprod()
+        prices = max_price * wealth / wealth.iloc[-1]
+        return prices, returns
+
+    def test_ambiguous_input_is_treated_as_returns_with_a_warning(self):
+        prices, _ = self._series()
+
+        with pytest.warns(UserWarning, match=r"\[0, 1\]"):
+            prepared = utils._prepare_returns(prices)
+
+        # Unchanged from before: the contract for [0, 1] input is still
+        # "returns", but it is no longer silent.
+        pd.testing.assert_series_equal(prepared, prices)
+
+    def test_warning_names_the_escape_hatch(self):
+        prices, _ = self._series()
+        utils._PREPARE_RETURNS_CACHE.clear()
+
+        with pytest.warns(UserWarning, match="is_prices=True"):
+            utils._prepare_returns(prices)
+
+    def test_explicit_prices_convert_to_the_true_returns(self):
+        prices, returns = self._series()
+
+        prepared = utils.to_returns(prices, is_prices=True)
+
+        np.testing.assert_allclose(
+            prepared.iloc[1:].values, returns.iloc[1:].values, rtol=1e-9
+        )
+
+    def test_flagged_sub_dollar_prices_match_the_above_one_control(self):
+        prices, returns = self._series()
+        control = 100 * (prices / prices.iloc[0])
+
+        flagged = stats.sharpe(utils.to_returns(prices, is_prices=True))
+        above_one = stats.sharpe(control)
+
+        # Both are the same return path, so the ratio must agree -- and must
+        # not be the 233-style figure the levels produced (#571).
+        assert flagged == pytest.approx(above_one, abs=0.05)
+        assert abs(flagged) < 5
+
+    def test_drawdown_accepts_the_override(self):
+        prices, returns = self._series()
+        expected = float(
+            (returns + 1).cumprod().div((returns + 1).cumprod().cummax()).sub(1).min()
+        )
+
+        assert stats.max_drawdown(prices, is_prices=True) == pytest.approx(
+            expected, rel=1e-6
+        )
+        assert stats.to_drawdown_series(prices, is_prices=True).min() == pytest.approx(
+            expected, rel=1e-6
+        )
+
+    def test_unambiguous_input_does_not_warn(self):
+        prices, returns = self._series()
+        above_one = 100 * prices / prices.iloc[0]
+
+        for series in (returns, above_one):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                utils._prepare_returns(series)
+
+    def test_dataframe_warns_only_for_the_ambiguous_column(self):
+        prices, returns = self._series()
+        above_one = 100 * prices / prices.iloc[0]
+        frame = pd.DataFrame(
+            {"token": prices.values, "equity": above_one.values}, index=prices.index
+        )
+
+        with pytest.warns(UserWarning, match="'token'"):
+            prepared = utils._prepare_returns(frame)
+
+        # The $1+ column is still detected and converted as before.
+        assert prepared["equity"].dropna().abs().max() < 1
+
+    def test_dataframe_override_applies_to_every_column(self):
+        prices, _ = self._series()
+        frame = pd.DataFrame(
+            {"a": prices.values, "b": (prices * 0.5).values}, index=prices.index
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            prepared = utils._prepare_returns(frame, is_prices=True)
+
+        assert prepared.iloc[0].isna().all()
+        assert prepared.dropna().abs().max().max() < 1
+
+    def test_looks_like_returns_follows_the_override(self):
+        prices, _ = self._series()
+
+        assert utils._looks_like_returns(prices) is True
+        assert utils._looks_like_returns(prices, is_prices=True) is False
+
+    def test_cache_keeps_the_interpretations_apart(self):
+        prices, _ = self._series()
+
+        utils._PREPARE_RETURNS_CACHE.clear()
+        as_returns = utils._prepare_returns(prices, is_prices=False)
+        as_prices = utils._prepare_returns(prices, is_prices=True)
+
+        assert as_returns.equals(prices)
+        assert pd.isna(as_prices.iloc[0])
+        assert not as_prices.equals(prices)
+
+    def test_empty_column_is_not_invented_as_a_flat_line(self):
+        idx = pd.date_range("2024-01-01", periods=4)
+        frame = pd.DataFrame(
+            {"a": [0.01, 0.02, -0.01, 0.03], "empty": np.nan}, index=idx
+        )
+
+        prepared = utils._prepare_prices(frame)
+
+        assert prepared["empty"].isna().all()

@@ -19,6 +19,7 @@
 import datetime as _dt
 import io as _io
 import threading
+from warnings import warn as _warn
 
 import numpy as _np
 import pandas as _pd
@@ -107,7 +108,7 @@ _CACHE_MAX_SIZE = 100
 _cache_lock = threading.Lock()
 
 
-def _generate_cache_key(data, rf, nperiods, apply_rf=True):
+def _generate_cache_key(data, rf, nperiods, apply_rf=True, is_prices=None):
     """
     Generate a cache key for the _prepare_returns function
 
@@ -121,6 +122,8 @@ def _generate_cache_key(data, rf, nperiods, apply_rf=True):
         Number of periods parameter
     apply_rf : bool
         Whether excess returns are computed for this call
+    is_prices : bool, optional
+        Explicit price/returns interpretation for this call
 
     Returns
     -------
@@ -160,8 +163,10 @@ def _generate_cache_key(data, rf, nperiods, apply_rf=True):
             rf_key = repr(rf)
 
         # apply_rf belongs in the key too: identical data/rf/nperiods can be
-        # requested both with and without the excess-return adjustment.
-        key = f"{data_hash}_{metadata}_{rf_key}_{nperiods}_{apply_rf}"
+        # requested both with and without the excess-return adjustment. The
+        # same holds for an explicit is_prices: the same numbers mean
+        # different returns depending on how the caller said to read them.
+        key = f"{data_hash}_{metadata}_{rf_key}_{nperiods}_{apply_rf}_{is_prices}"
         return key
     except (ValueError, TypeError, AttributeError, MemoryError):
         # If hashing fails, return None to skip caching
@@ -305,7 +310,9 @@ def multi_shift(df, shift=3):
     return result
 
 
-def to_returns(prices: Returns, rf: float = 0.0) -> Returns:
+def to_returns(
+    prices: Returns, rf: float = 0.0, is_prices: bool | None = None
+) -> Returns:
     """
     Calculate simple arithmetic returns from price series
 
@@ -315,13 +322,19 @@ def to_returns(prices: Returns, rf: float = 0.0) -> Returns:
         Price data
     rf : float, default 0.0
         Risk-free rate
+    is_prices : bool, optional
+        Whether `prices` holds price levels, overriding detection. Pass
+        ``True`` for a price series that never exceeds $1 (a token, a penny
+        stock, a rebased index), which is otherwise indistinguishable from an
+        all-positive return series and is read as returns. ``None`` (default)
+        detects.
 
     Returns
     -------
     pd.Series or pd.DataFrame
         Simple arithmetic returns
     """
-    return _prepare_returns(prices, rf)
+    return _prepare_returns(prices, rf, is_prices=is_prices)
 
 
 def to_prices(returns: Returns, base: float = 1e5) -> Returns:
@@ -590,7 +603,54 @@ def to_excess_returns(
     return df
 
 
-def _looks_like_returns(data):
+def _classify_series(data):
+    """
+    Decide what one series looks like: ``"returns"``, ``"prices"`` or
+    ``"ambiguous"``.
+
+    A negative value can only be a return, and a value above 1 is read as a
+    price level (the historical test). Between the two -- every value in
+    [0, 1] -- the two are genuinely indistinguishable: a return series whose
+    periods all happen to be positive looks exactly like a price series that
+    never trades above $1 (a token, a penny stock, a rebased index).
+    """
+    values = data.dropna()
+    if values.empty:
+        # No observation to judge. Report "prices" so nothing is converted:
+        # a return series here would otherwise be rebuilt as a flat line at
+        # the base value, inventing data out of an empty column.
+        return "prices"
+    if values.min() < 0:
+        return "returns"
+    if values.max() > 1:
+        return "prices"
+    return "ambiguous"
+
+
+def _classify(data):
+    """
+    Classify input as a whole: a kind string for a Series, a per-column dict
+    for a DataFrame (columns are judged independently, as they always were).
+    """
+    if isinstance(data, _pd.DataFrame):
+        return {col: _classify_series(data[col]) for col in data.columns}
+    return _classify_series(data)
+
+
+def _warn_ambiguous(columns=None):
+    """Explain that [0, 1] input was treated as returns, and how to say
+    otherwise."""
+    where = "" if columns is None else f" in column(s) {list(columns)!r}"
+    _warn(
+        f"Input{where} has every value in [0, 1], where a return series and a "
+        "price series that never exceeds $1 are indistinguishable. Treating it "
+        "as returns. If these are prices, convert them with "
+        "to_returns(..., is_prices=True) first.",
+        stacklevel=3,
+    )
+
+
+def _looks_like_returns(data, is_prices=None):
     """
     Report whether `data` will be read as returns rather than prices.
 
@@ -600,10 +660,16 @@ def _looks_like_returns(data):
     Drawdown needs that distinction: rebuilt prices start from a known
     baseline, while a real price series starts at its first print.
 
+    Ambiguous input (every value in [0, 1]) counts as returns, which is the
+    interpretation `_prepare_returns()` applies to it.
+
     Parameters
     ----------
     data : pd.Series or pd.DataFrame
         Input data (returns or prices)
+    is_prices : bool, optional
+        Explicit answer, overriding detection. ``True`` means prices,
+        ``False`` means returns, ``None`` (default) means detect.
 
     Returns
     -------
@@ -611,16 +677,19 @@ def _looks_like_returns(data):
         A bool for Series input, a per-column bool Series for DataFrame input
     """
     if isinstance(data, _pd.DataFrame):
-        flags = {}
-        for col in data.columns:
-            col_clean = data[col].dropna()
-            flags[col] = bool(col_clean.min() <= 0 or col_clean.max() < 1)
-        return _pd.Series(flags, dtype=bool)
+        if is_prices is not None:
+            return _pd.Series(not is_prices, index=data.columns, dtype=bool)
+        return _pd.Series(
+            {col: _classify_series(data[col]) != "prices" for col in data.columns},
+            dtype=bool,
+        )
 
-    return bool(data.min() < 0 or data.max() < 1)
+    if is_prices is not None:
+        return not is_prices
+    return _classify_series(data) != "prices"
 
 
-def _prepare_prices(data, base=1.0):
+def _prepare_prices(data, base=1.0, is_prices=None):
     """
     Convert return data into prices and perform cleanup
 
@@ -630,6 +699,10 @@ def _prepare_prices(data, base=1.0):
         Input data (returns or prices)
     base : float, default 1.0
         Base value for price conversion
+    is_prices : bool, optional
+        Whether `data` already holds price levels, overriding detection. See
+        `_prepare_returns()`; input with every value in [0, 1] is ambiguous
+        and is read as returns, with a warning, unless this is passed.
 
     Returns
     -------
@@ -637,15 +710,23 @@ def _prepare_prices(data, base=1.0):
         Cleaned price data
     """
     data = data.copy()
-    looks_like_returns = _looks_like_returns(data)
+    kinds = _classify(data)
+    looks_like_returns = _looks_like_returns(data, is_prices)
 
     if isinstance(data, _pd.DataFrame):
+        if is_prices is None:
+            ambiguous = [col for col, kind in kinds.items() if kind == "ambiguous"]
+            if ambiguous:
+                _warn_ambiguous(ambiguous)
         for col in data.columns:
             if looks_like_returns[col]:
                 data[col] = to_prices(data[col], base)
 
-    elif looks_like_returns:
-        data = to_prices(data, base)
+    else:
+        if is_prices is None and kinds == "ambiguous":
+            _warn_ambiguous()
+        if looks_like_returns:
+            data = to_prices(data, base)
 
     # These are prices, not returns, so a missing observation must not become
     # 0: that asserts the asset was worth nothing that day and shows up as a
@@ -673,7 +754,7 @@ def _rf_is_nonzero(rf):
     return rf > 0
 
 
-def _prepare_returns(data, rf=0.0, nperiods=None, apply_rf=True):
+def _prepare_returns(data, rf=0.0, nperiods=None, apply_rf=True, is_prices=None):
     """
     Convert price data into returns and perform cleanup
 
@@ -693,14 +774,34 @@ def _prepare_returns(data, rf=0.0, nperiods=None, apply_rf=True):
         calling function's name through inspect.stack(), which meant the
         result depended on who called rather than on what was asked for,
         and could not be overridden.
+    is_prices : bool, optional
+        Whether `data` holds price levels, overriding detection. ``True``
+        converts with `pct_change()`; ``False`` leaves the data alone.
+        ``None`` (default) detects: a negative value can only be a return,
+        and a value above 1 is read as a price level. Input with every value
+        in [0, 1] is ambiguous -- a price series that never trades above $1
+        and an all-positive return series look the same -- so it is treated
+        as returns and a warning is emitted. Pass this explicitly to say
+        which one it is.
 
     Returns
     -------
     pd.Series or pd.DataFrame
         Cleaned returns data
     """
+    # Classify before consulting the cache: an ambiguous series must warn on
+    # every call, not only the first one that misses the cache.
+    kinds = _classify(data)
+    if is_prices is None:
+        if isinstance(kinds, dict):
+            ambiguous = [col for col, kind in kinds.items() if kind == "ambiguous"]
+            if ambiguous:
+                _warn_ambiguous(ambiguous)
+        elif kinds == "ambiguous":
+            _warn_ambiguous()
+
     # Try to get from cache first
-    cache_key = _generate_cache_key(data, rf, nperiods, apply_rf)
+    cache_key = _generate_cache_key(data, rf, nperiods, apply_rf, is_prices)
     if cache_key:
         with _cache_lock:
             if cache_key in _PREPARE_RETURNS_CACHE:
@@ -708,16 +809,11 @@ def _prepare_returns(data, rf=0.0, nperiods=None, apply_rf=True):
 
     data = data.copy()
 
-    # Process DataFrame columns
     if isinstance(data, _pd.DataFrame):
-        for col in data.columns:
-            # Cache dropna operation to avoid repeated computation
-            col_clean = data[col].dropna()
-            # Check if data looks like prices (positive values > 1)
-            if col_clean.min() >= 0 and col_clean.max() > 1:
+        for col, kind in kinds.items():
+            if is_prices is True or (is_prices is None and kind == "prices"):
                 data[col] = data[col].pct_change(fill_method=None)
-    # Process Series data
-    elif data.min() >= 0 and data.max() > 1:
+    elif is_prices is True or (is_prices is None and kinds == "prices"):
         data = data.pct_change(fill_method=None)
 
     # cleanup data - replace infinite values with NaN

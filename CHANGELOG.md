@@ -1,6 +1,27 @@
 Changelog
 ===========
 
+0.0.87
+------
+
+- `_prepare_returns()` now warns when input is ambiguous instead of silently
+  guessing (#571). It decided "prices vs returns" with `max > 1`, so a price
+  series that never trades above $1 -- a token, a penny stock, a rebased
+  index -- was passed through as returns: `stats.sharpe()` on such a series
+  returned 233.73 where its true returns gave -0.07, with no warning and
+  `_looks_like_returns()` reporting `True`. Input with every value in
+  [0, 1] is now reported as ambiguous: it is still treated as returns, for
+  backward compatibility, but a `UserWarning` says so and names the fix.
+- Added an explicit `is_prices` override to `to_returns()`,
+  `max_drawdown()` and `to_drawdown_series()`, and to the internal
+  `_prepare_returns()` / `_prepare_prices()`. `to_returns(prices,
+  is_prices=True)` converts a sub-$1 price series correctly, and
+  `stats.max_drawdown(prices, is_prices=True)` reports its real drawdown
+  instead of 0. The flag is part of the `_prepare_returns()` cache key, so
+  the two interpretations cannot share an entry.
+- An all-NaN column is no longer rebuilt as a flat line at the base value;
+  it stays `NaN`.
+
 0.0.86
 ------
 

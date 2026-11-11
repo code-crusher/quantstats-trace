@@ -2674,7 +2674,7 @@ def _get_baseline_value(prices, from_returns):
     return 1.0 if bool(from_returns) else prices.iloc[0]
 
 
-def max_drawdown(prices: Returns) -> float:
+def max_drawdown(prices: Returns, is_prices: bool | None = None) -> float:
     """
     Calculate the maximum drawdown from peak to trough.
 
@@ -2684,6 +2684,11 @@ def max_drawdown(prices: Returns) -> float:
 
     Args:
         prices (pd.Series): Price series or cumulative returns
+        is_prices (bool, optional): Whether `prices` holds price levels,
+            overriding detection. Pass True for a price series that never
+            exceeds $1, which is otherwise indistinguishable from an
+            all-positive return series and is read as returns. None
+            (default) detects.
 
     Returns:
         float: Maximum drawdown (negative value)
@@ -2697,10 +2702,10 @@ def max_drawdown(prices: Returns) -> float:
 
     # Record whether these were returns *before* the conversion, so the
     # baseline below knows if there is a known starting equity
-    from_returns = _utils._looks_like_returns(prices)
+    from_returns = _utils._looks_like_returns(prices, is_prices)
 
     # Prepare prices (convert from returns if needed)
-    prices = _utils._prepare_prices(prices)
+    prices = _utils._prepare_prices(prices, is_prices=is_prices)
 
     if len(prices) == 0:
         return 0.0
@@ -2726,7 +2731,7 @@ def max_drawdown(prices: Returns) -> float:
     return (extended_prices / extended_prices.expanding(min_periods=0).max()).min() - 1
 
 
-def to_drawdown_series(returns):
+def to_drawdown_series(returns, is_prices: bool | None = None):
     """
     Convert returns series to drawdown series.
 
@@ -2736,6 +2741,11 @@ def to_drawdown_series(returns):
 
     Args:
         returns (pd.Series): Return series to convert
+        is_prices (bool, optional): Whether `returns` holds price levels,
+            overriding detection. Pass True for a price series that never
+            exceeds $1, which is otherwise indistinguishable from an
+            all-positive return series and is read as returns. None
+            (default) detects.
 
     Returns:
         pd.Series: Drawdown series (negative values showing decline from peak)
@@ -2748,10 +2758,10 @@ def to_drawdown_series(returns):
     validate_input(returns)
 
     # Record whether these were returns *before* the conversion
-    from_returns = _utils._looks_like_returns(returns)
+    from_returns = _utils._looks_like_returns(returns, is_prices)
 
     # Convert returns to prices
-    prices = _utils._prepare_prices(returns)
+    prices = _utils._prepare_prices(returns, is_prices=is_prices)
 
     if len(prices) == 0:
         return _pd.Series([], dtype=float, index=returns.index)
