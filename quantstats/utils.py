@@ -107,6 +107,11 @@ _PREPARE_RETURNS_CACHE = {}
 _CACHE_MAX_SIZE = 100
 _cache_lock = threading.Lock()
 
+# Datasets already reported as ambiguous, so one reports.metrics() call does
+# not emit the same warning from every metric it computes.
+_AMBIGUOUS_WARNED = set()
+_AMBIGUOUS_WARNED_MAX_SIZE = 100
+
 
 def _generate_cache_key(data, rf, nperiods, apply_rf=True, is_prices=None):
     """
@@ -620,6 +625,11 @@ def _classify_series(data):
         # a return series here would otherwise be rebuilt as a flat line at
         # the base value, inventing data out of an empty column.
         return "prices"
+    if (values == 0).all():
+        # A flat series. Neither a price path nor a plausible return series,
+        # and converting it would be a no-op anyway, so there is nothing to
+        # warn about.
+        return "returns"
     if values.min() < 0:
         return "returns"
     if values.max() > 1:
@@ -637,9 +647,31 @@ def _classify(data):
     return _classify_series(data)
 
 
-def _warn_ambiguous(columns=None):
-    """Explain that [0, 1] input was treated as returns, and how to say
-    otherwise."""
+def _warn_ambiguous(data, columns=None):
+    """
+    Explain that [0, 1] input was treated as returns, and how to say
+    otherwise.
+
+    Warned once per dataset: `reports.metrics()` computes dozens of
+    statistics over the same series, and repeating the message for each one
+    would bury it. Callers that need the warning again for the same data can
+    clear `_AMBIGUOUS_WARNED`.
+    """
+    # Keyed on the values alone, not the container: reports.metrics() passes
+    # the same numbers as a Series and as a one-column frame, and one message
+    # covers both. The values are flattened first so the two hash alike.
+    try:
+        values = data.to_numpy(dtype=float, na_value=_np.nan).ravel()
+        dataset_key = (len(values), int(_pd.util.hash_array(values).sum()))
+    except (ValueError, TypeError, AttributeError):
+        dataset_key = (id(data), len(data))
+    with _cache_lock:
+        if dataset_key in _AMBIGUOUS_WARNED:
+            return
+        if len(_AMBIGUOUS_WARNED) >= _AMBIGUOUS_WARNED_MAX_SIZE:
+            _AMBIGUOUS_WARNED.clear()
+        _AMBIGUOUS_WARNED.add(dataset_key)
+
     where = "" if columns is None else f" in column(s) {list(columns)!r}"
     _warn(
         f"Input{where} has every value in [0, 1], where a return series and a "
@@ -717,14 +749,14 @@ def _prepare_prices(data, base=1.0, is_prices=None):
         if is_prices is None:
             ambiguous = [col for col, kind in kinds.items() if kind == "ambiguous"]
             if ambiguous:
-                _warn_ambiguous(ambiguous)
+                _warn_ambiguous(data, ambiguous)
         for col in data.columns:
             if looks_like_returns[col]:
                 data[col] = to_prices(data[col], base)
 
     else:
         if is_prices is None and kinds == "ambiguous":
-            _warn_ambiguous()
+            _warn_ambiguous(data)
         if looks_like_returns:
             data = to_prices(data, base)
 
@@ -796,9 +828,9 @@ def _prepare_returns(data, rf=0.0, nperiods=None, apply_rf=True, is_prices=None)
         if isinstance(kinds, dict):
             ambiguous = [col for col, kind in kinds.items() if kind == "ambiguous"]
             if ambiguous:
-                _warn_ambiguous(ambiguous)
+                _warn_ambiguous(data, ambiguous)
         elif kinds == "ambiguous":
-            _warn_ambiguous()
+            _warn_ambiguous(data)
 
     # Try to get from cache first
     cache_key = _generate_cache_key(data, rf, nperiods, apply_rf, is_prices)

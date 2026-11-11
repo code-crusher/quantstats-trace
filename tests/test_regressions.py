@@ -941,6 +941,13 @@ class TestSubDollarPriceDetection:
     plausible-looking number instead of raising or warning.
     """
 
+    @pytest.fixture(autouse=True)
+    def _fresh_warning_state(self):
+        """The warning is deduplicated per dataset; start each test clean."""
+        utils._AMBIGUOUS_WARNED.clear()
+        yield
+        utils._AMBIGUOUS_WARNED.clear()
+
     @staticmethod
     def _series(max_price=0.6):
         rng = np.random.default_rng(42)
@@ -1011,7 +1018,7 @@ class TestSubDollarPriceDetection:
                 utils._prepare_returns(series)
 
     def test_dataframe_warns_only_for_the_ambiguous_column(self):
-        prices, returns = self._series()
+        prices, _ = self._series()
         above_one = 100 * prices / prices.iloc[0]
         frame = pd.DataFrame(
             {"token": prices.values, "equity": above_one.values}, index=prices.index
@@ -1052,6 +1059,28 @@ class TestSubDollarPriceDetection:
         assert as_returns.equals(prices)
         assert pd.isna(as_prices.iloc[0])
         assert not as_prices.equals(prices)
+
+    def test_warning_is_emitted_once_per_dataset(self):
+        # reports.metrics() runs dozens of statistics over the same series;
+        # repeating the message for each one would bury it.
+        prices, _ = self._series()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(5):
+                utils._prepare_returns(prices)
+
+        assert len(caught) == 1
+
+    def test_metrics_warns_once_not_per_statistic(self):
+        prices, _ = self._series()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            reports.metrics(prices)
+
+        ambiguous = [w for w in caught if "[0, 1]" in str(w.message)]
+        assert len(ambiguous) == 1
 
     def test_empty_column_is_not_invented_as_a_flat_line(self):
         idx = pd.date_range("2024-01-01", periods=4)
