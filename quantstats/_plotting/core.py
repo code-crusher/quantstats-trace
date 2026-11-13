@@ -255,7 +255,9 @@ def plot_returns_bars(
     # Adjust colors if no benchmark
     if benchmark is None:
         colors = colors[1:]
-    df.plot(kind="bar", ax=ax, color=colors)
+    # plot against string labels to keep the x-axis categorical (pandas >= 3.1
+    # otherwise installs dynamic date ticks, which breaks set_xticklabels)
+    df.set_axis(df.index.astype(str)).plot(kind="bar", ax=ax, color=colors)
 
     # Set background colors
     fig.set_facecolor("white")

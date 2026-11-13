@@ -4,6 +4,7 @@ Tests for quantstats.plots module
 
 import os
 import tempfile
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -53,6 +54,30 @@ class TestPlotFunctions:
         """Test yearly returns bar chart."""
         fig = plots.yearly_returns(sample_returns, show=False)
         assert fig is not None
+
+    def test_yearly_returns_no_ticklabel_warning(self, sample_returns):
+        """Test yearly returns does not warn about set_xticklabels (issue #582).
+
+        pandas >= 3.1 installs dynamic date ticks for datetime-indexed bar
+        plots, which triggers a matplotlib UserWarning when calling
+        set_xticklabels() without fixed ticks.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fig = plots.yearly_returns(sample_returns, show=False)
+        assert fig is not None
+        ticklabel_warnings = [
+            w for w in caught if "set_ticklabels()" in str(w.message)
+        ]
+        assert not ticklabel_warnings, ticklabel_warnings
+
+    def test_yearly_returns_tick_labels(self, sample_returns):
+        """Test yearly returns x-axis shows year labels."""
+        fig = plots.yearly_returns(sample_returns, show=False)
+        labels = [t.get_text() for t in fig.axes[0].get_xticklabels()]
+        assert labels  # non-empty
+        years = {label for label in labels if label}
+        assert years <= {"2020", "2021"}, years
 
     def test_histogram(self, sample_returns, sample_benchmark):
         """Test histogram plot."""
